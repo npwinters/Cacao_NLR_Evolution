@@ -1,0 +1,442 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(tidyverse)
+library(cowplot)
+library(scales)
+library(performance)
+library(multcompView)
+library(Hmisc)
+library(data.table)
+library(emmeans)
+library(MASS)
+```
+
+
+```{r}
+#################
+### Arguments ### 
+#################
+dup_file <- "evol_analyses/MCScanX/all_10x_pep_10aug2021_geneDupType.txt"
+class_file <- "annotation/pfam_output/all_10x_pep_10aug2021_nbarc_rpw8_tir_hmm_nlrparser_nlrClass.txt"
+ortho_file <- "evol_analyses/nlrGeneFamilyClassification_Aug2021/proteins.both.37Gv1.0.bestOrthos"
+gene_content <- "genome_files/proteins/gene_content_perGntype.txt"
+aed_scores <- "genome_files/gff/meta_assembly_annotations/metaAssembly_annot_aedScores.txt"
+gene_pos_file <- "ideogram_files/allGntype_genePos.txt"
+te_file  <- "~/GradSchool/Research/Projects/NSF_PlantGenome/NLR_Comparative_Genomics/genome_files/transposable_elements/allGntypes_annot_te.txt"
+pseudogene_file <- "~/GradSchool/Research/Projects/NSF_PlantGenome/NLR_Comparative_Genomics/evol_analyses/pseudogene/allGntype_pseudogene_pos.txt"
+
+```
+
+
+```{r}
+setwd("/Users/noah/GradSchool/Research/Projects/NSF_PlantGenome/NLR_Comparative_Genomics")
+####################
+### Read in data ### 
+####################
+
+# Categorization of each genes' duplication status using MCScanX (Wang et al., 2012)
+# 0 = singleton
+# 1 = dispersed duplicate
+# 2 = proximal duplicate
+# 3 = tandem duplicate
+# 4 = segmental duplicate
+dup <- read.table(dup_file, header = FALSE) %>%
+  setNames(nm = c("Gene", "Dup_Type")) %>%
+  mutate(Dup_Type = ifelse(Dup_Type == 0, "singleton", 
+                           ifelse(Dup_Type == 1, "dispersed",
+                                  ifelse(Dup_Type == 2, "proximal",
+                                         ifelse(Dup_Type == 3, "tandem", "segmental")))))
+
+# NLR class categorization table--genes without Pfam domains are excluded 
+class <- read.table(class_file, header = TRUE)
+
+# The orthogroup classification contains the complete set of genes predicted to be NLRs
+# The NLR class categorization is a smaller subset and excludes genes without any Pfam domains 
+# The difference is small, only ~30 genes
+ortho <- read.table(ortho_file, sep = '\t', header = TRUE) %>%
+  setNames(nm = c("Gene", "Orthogroup")) %>%
+  inner_join(class, by = "Gene") %>%
+  mutate(Gene = ifelse(Genotype == "Matina", gsub("\\.1\\.p", "", Gene), gsub("\\.1", "", Gene))) %>%
+  mutate(Gene = gsub("_p", "_g", Gene))
+
+# Merge data frames
+nlr <- inner_join(dup, ortho, by = "Gene") %>%
+  add_column(is_nlr = rep("NLR", nrow(.)))
+
+nlr$Chr <- str_replace_all(as.character(nlr$Gene), c("Thecc\\." = "", "G[0-9].*" = "")) %>%
+  str_replace_all(c("Tc" = "", "v2_[a-z].*" = "")) %>% 
+  str_replace_all(c("Chr0v1" = "0", "^[A-Z].*_Chr" = "", "v1_.*" = "")) %>% 
+  str_replace_all(c("^0" = "", "Un" = "0", "[A-Z].*" = "0"))
+
+non_nlr <- anti_join(dup, ortho, by = "Gene") %>%
+  add_column(Genotype = ifelse(grepl("Thecc", .$Gene), "Matina",
+                               ifelse(grepl("Tc.*", .$Gene), "Criollo", gsub("_Chr.*", "", .$Gene))),
+             is_nlr = rep("Non-NLR", nrow(.)))
+
+te <- fread(te_file, header = TRUE) %>%
+  filter(TE_Desc != "Unknown" & TE_Desc != "Unspecified") %>% 
+  mutate(TE_Type = case_when(
+    grepl("LTR", TE_Desc) ~ "LTR",
+    grepl("LINE", TE_Desc) ~ "LINE",
+    grepl("SINE", TE_Desc) ~ "SINE",
+    grepl("DNA", TE_Desc) ~ "DNA",
+    grepl("Helitron", TE_Desc) ~ "Helitron",
+    FALSE ~ "NOTHING"
+  )) %>% 
+  mutate(Genotype = gsub("_Chr[0-9].*", "", Chr)) %>%
+  mutate(Chr = gsub("^[A-Z].*_", "", Chr)) %>% 
+  na.omit()
+
+pseudogenes <- read.table(pseudogene_file, sep = "\t", header = 1) %>%
+  mutate(Chr = gsub("sCAffold", "Matina", Chr)) %>%
+  separate(Chr, into = c("Genotype", "Chr"), sep = "_")
+  
+
+```
+
+
+# PLOT: Number of NLR x Number of TEs 
+```{r}
+############
+### PLOT ###
+############
+# PLOT: Number of NLR x Number of TEs 
+te_sum <- 
+  te %>% 
+  group_by(Genotype, TE_Type) %>% 
+  tally(name = "num_te")
+  
+
+nlr %>% 
+  group_by(Genotype) %>% 
+  tally(name = "num_nlr") %>%
+  inner_join(te_sum, by = "Genotype") %>% 
+  add_column(CNV = ifelse(.$Genotype == "CCN-51" | .$Genotype == "ICS-1" |
+                            .$Genotype == "GU-257E" | .$Genotype == "NA-246", "Low", "High")) %>%
+  ggplot(aes(x = CNV, y = num_te, fill = CNV)) + 
+  geom_jitter(width = 0.2, pch = 21, color = "black", size = 4) +
+  stat_summary(aes(color = CNV), fun = mean, shape = 5,
+               position = position_dodge(width = 0.75),
+               show.legend = FALSE, size = 1, color = "black") +
+  stat_summary(aes(color = CNV),
+               fun.data = mean_cl_normal,
+               geom = "errorbar",
+               width= 0.0,
+               position = position_dodge(width = 0.75),
+               show.legened = FALSE,
+               color = "black") +
+  facet_wrap(~TE_Type, scales = "free") + 
+  theme_minimal_grid(font_size = 15) + 
+  theme(
+    strip.background = element_rect(color = "lightgrey"),
+    legend.position = c(0.90,0.3), 
+    legend.direction = "horizontal", 
+    legend.justification = "right"
+  ) + 
+  scale_fill_manual(values = c("Low" = "#7876B1FF", "High" = "#E18727FF")) + 
+  labs(x = NULL, y = "# Transposable Elements", fill = NULL) + 
+  guides(fill=guide_legend(override.aes = list(size=6)))
+
+
+ggsave("~/GradSchool/Research/Projects/NSF_PlantGenome/NLR_Comparative_Genomics/figures/te_numType_lowHigh.pdf", height = 5, width = 9)
+
+```
+
+# MODEL: Number of NLR x Number of TEs 
+```{r}
+# Model
+mod <- 
+  nlr %>% 
+  group_by(Genotype) %>% 
+  tally(name = "num_nlr") %>%
+  inner_join(te_sum, by = "Genotype") %>% 
+  add_column(CNV = ifelse(.$Genotype == "CCN-51" | .$Genotype == "ICS-1" |
+                            .$Genotype == "GU-257E" | .$Genotype == "NA-246", "Low", "High"))
+
+# Does not seem to m
+x<-aov(num_nlr ~ CNV + TE_Type + CNV:TE_Type, mod)
+check_model(aov(num_nlr ~ CNV + TE_Type + CNV:TE_Type, mod))
+
+
+# Fit a GLM with a poisson distribution--good place to start for count data
+glm_mod <- glm(num_te ~ CNV + TE_Type + CNV:TE_Type, family = poisson, data = mod)
+
+# Does a poisson dist fit the data? If p > 0.05 a poisson dist is appropriate
+1 - pchisq(summary(glm_mod)$deviance, summary(glm_mod)$df.residual)
+
+# Fit a GLM with a negative binomial distribution--poisson didn't seem to fit
+glm_mod <- glm.nb(num_te ~ CNV + TE_Type + CNV:TE_Type,  data = mod)
+
+# Does a negative binomial dist fit the data? If p > 0.05 a negative binomial dist is appropriate
+1 - pchisq(summary(glm_mod)$deviance, summary(glm_mod)$df.residual)
+
+# Use emmeans to do posthoc comparisons
+pairs(emmeans(glm_mod, ~ CNV + TE_Type + CNV:TE_Type))
+
+```
+
+# PLOT: Number of TE x Chr positions for each TE
+```{r}
+############
+### PLOT ###
+############
+te_sum <- 
+  te %>% 
+  group_by(Genotype, TE_Type, Chr) %>% 
+  tally(name = "num_te")
+
+nlr %>% 
+  group_by(Genotype, Chr) %>% 
+  tally(name = "num_nlr") %>%
+  mutate(Chr = gsub("^", "Chr", Chr)) %>%
+  inner_join(te_sum, by = c("Genotype", "Chr")) %>% 
+  add_column(CNV = ifelse(.$Genotype == "CCN-51" | .$Genotype == "ICS-1" |
+                            .$Genotype == "GU-257E" | .$Genotype == "NA-246", "Low", "High")) %>%
+  filter(Chr != "Chr0") %>%
+  mutate(Chr = factor(Chr, 
+                      levels = c("Chr1", "Chr2", "Chr3", "Chr4", "Chr5",
+                                      "Chr6", "Chr7", "Chr8", "Chr9", "Chr10"),
+                      labels = c("Chr1", "Chr2", "Chr3", "Chr4", "Chr5",
+                                 "Chr6", "Chr7", "Chr8", "Chr9", "Chr10"))) %>%
+  mutate(CNV = factor(CNV, 
+                      levels = c("Low", "High"),
+                      labels = c("Low", "High"))) %>%
+  ggplot(aes(x = Chr, y = num_te, fill = CNV)) + 
+  geom_point(position = position_jitterdodge(jitter.width = 0.2), 
+             pch = 21, color = "black", size = 3) +
+  stat_summary(aes(color = CNV), fun = mean, shape = 5,
+               position = position_dodge(width = 0.75),
+               show.legend = FALSE, color = "black") +
+  stat_summary(aes(color = CNV),
+               fun.data = mean_cl_normal,
+               geom = "errorbar",
+               width= 0.0,
+               position = position_dodge(width = 0.75),
+               show.legened = FALSE,
+               color = "black") +
+  facet_wrap(~TE_Type, scales = "free") + 
+  theme_minimal_grid(font_size = 15) + 
+  theme(
+    strip.background = element_rect(color = "lightgrey"),
+    legend.position = c(0.90,0.3), 
+    legend.direction = "horizontal", 
+    legend.justification = "right",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) + 
+  scale_fill_manual(values = c("Low" = "#7876B1FF", "High" = "#E18727FF")) + 
+  labs(x = NULL, y = "# Transposable Elements", fill = NULL) + 
+  guides(fill=guide_legend(override.aes = list(size=6)))
+
+
+ggsave("~/GradSchool/Research/Projects/NSF_PlantGenome/NLR_Comparative_Genomics/figures/te_numType_lowHigh_pos.pdf", height = 7, width = 13)
+```
+
+
+```{r}
+#----------------------------------------------
+# Does any TE class have significantly higher abundance among NLR-dense chromosomes, Chr5, Chr6, Chr7, or Chr10?
+#----------------------------------------------
+
+# Model
+mod <- 
+  nlr %>% 
+  group_by(Genotype, Chr) %>% 
+  tally(name = "num_nlr") %>%
+  mutate(Chr = gsub("^", "Chr", Chr)) %>%
+  inner_join(te_sum, by = c("Genotype", "Chr")) %>% 
+  add_column(CNV = ifelse(.$Genotype == "CCN-51" | .$Genotype == "ICS-1" |
+                            .$Genotype == "GU-257E" | .$Genotype == "NA-246", "Low", "High")) %>%
+  filter(Chr != "Chr0")
+
+
+# Does not seem to m
+check_model(aov(num_te ~ Chr + TE_Type + Chr:TE_Type, mod))
+
+# Fit a GLM with a negative binomial distribution--poisson didn't seem to fit
+glm_mod <- glm.nb(num_te ~ Chr + TE_Type + Chr:TE_Type,  data = mod)
+
+# Does a negative binomial dist fit the data? If p > 0.05 a negative binomial dist is appropriate
+1 - pchisq(summary(glm_mod)$deviance, summary(glm_mod)$df.residual)
+
+# Use emmeans to do posthoc comparisons
+pairs(emmeans(glm_mod,  ~ Chr + TE_Type + Chr:TE_Type))
+
+mod <- summary(pairs(emmeans(glm_mod,  ~ Chr + TE_Type + Chr:TE_Type)))
+
+mod <- 
+  mod %>% 
+  mutate(First_Chrom = gsub(" [A-Z].* -.*", "", contrast),
+          Second_Chrom = gsub("^Chr.* -", "", contrast)) %>% 
+  mutate(Second_Chrom = gsub(" [D|H|L|S].*", "", Second_Chrom)) %>% 
+  mutate(Both_TE = gsub("Chr", "", contrast)) %>% 
+  mutate(Both_TE = gsub("[0-9].", "", Both_TE)) %>% 
+  mutate(Both_TE = gsub(" ", "", Both_TE)) %>% 
+  filter(Both_TE == "DNA-DNA" | Both_TE == "Helitron-Helitron"|
+           Both_TE == "LTR-LTR" | Both_TE == "LINE-LINE" |
+           Both_TE == "SINE-SINE")
+
+
+#----------------------------------------------
+# Do any of the chromosomes display significant differences in TE content between Low and High CNV genotypes?
+#----------------------------------------------
+
+# Model
+mod <- 
+  nlr %>% 
+  group_by(Genotype, Chr) %>% 
+  tally(name = "num_nlr") %>%
+  mutate(Chr = gsub("^", "Chr", Chr)) %>%
+  inner_join(te_sum, by = c("Genotype", "Chr")) %>% 
+  add_column(CNV = ifelse(.$Genotype == "CCN-51" | .$Genotype == "ICS-1" |
+                            .$Genotype == "GU-257E" | .$Genotype == "NA-246", "Low", "High")) %>%
+  filter(Chr != "Chr0")
+
+
+# Fit a GLM with a negative binomial distribution--poisson didn't seem to fit
+glm_mod <- glm.nb(num_te ~ CNV + Chr + TE_Type + Chr:TE_Type:CNV,  data = mod)
+
+# Does a negative binomial dist fit the data? If p > 0.05 a negative binomial dist is appropriate
+1 - pchisq(summary(glm_mod)$deviance, summary(glm_mod)$df.residual)
+
+# Use emmeans to do posthoc comparisons
+pairs(emmeans(glm_mod,  ~ Chr + TE_Type + Chr:TE_Type))
+
+# Pairwise comparisons using emmeans
+mod <- summary(pairs(emmeans(glm_mod,  ~ CNV + Chr + TE_Type + Chr:TE_Type:CNV)))
+
+# Parse output to find comparisons of interest
+mod <- 
+  mod %>% 
+  .[grepl("High.* - Low", .$contrast), ] %>% 
+  mutate(contrast = gsub("High ", "", contrast)) %>%
+  mutate(contrast = gsub("Low ", "", contrast)) %>% 
+  mutate(contrast = gsub(" - ", "|", contrast)) %>% 
+  separate(col = contrast, into = c("High", "Low"), sep = "\\|") %>% 
+  filter(High == Low)
+  
+```
+
+
+# More narrow subdivisions of TE--i.e. types of LTR and DNA elements
+```{r}
+# Which class of element?
+te_type <- "SINE"
+
+# Filter out types that have very few individuals
+te_sum_remove <- 
+  te %>% 
+  filter(TE_Type == te_type) %>%
+  group_by(Genotype, TE_Desc, Chr) %>% 
+  tally(name = "num_te_type") %>%
+  group_by(TE_Desc) %>% 
+  summarise(te_total = sum(num_te_type)) %>% 
+  filter(te_total > 1000)
+
+# Tally abundance per chromosome
+te_sum <- 
+  te %>% 
+  filter(TE_Type == te_type) %>%
+  group_by(Genotype, TE_Desc, Chr) %>% 
+  tally(name = "num_te_type") %>%
+  .[.$TE_Desc %in% te_sum_remove$TE_Desc,]
+
+# Plot
+te_sum %>% 
+  add_column(CNV = ifelse(.$Genotype == "CCN-51" | .$Genotype == "ICS-1" |
+                            .$Genotype == "GU-257E" | .$Genotype == "NA-246", "Low", "High")) %>%
+  filter(Chr != "Chr0") %>%
+  mutate(Chr = factor(Chr, 
+                      levels = c("Chr1", "Chr2", "Chr3", "Chr4", "Chr5",
+                                      "Chr6", "Chr7", "Chr8", "Chr9", "Chr10"),
+                      labels = c("Chr1", "Chr2", "Chr3", "Chr4", "Chr5",
+                                 "Chr6", "Chr7", "Chr8", "Chr9", "Chr10"))) %>%
+  mutate(CNV = factor(CNV, 
+                      levels = c("Low", "High"),
+                      labels = c("Low", "High"))) %>%
+  ggplot(aes(x = Chr, y = num_te_type, fill = CNV)) + 
+  geom_point(position = position_jitterdodge(jitter.width = 0.2), 
+             pch = 21, color = "black", size = 3) +
+  stat_summary(aes(color = CNV), fun = mean, shape = 5,
+               position = position_dodge(width = 0.75),
+               show.legend = FALSE, color = "black") +
+  stat_summary(aes(color = CNV),
+               fun.data = mean_cl_normal,
+               geom = "errorbar",
+               width= 0.0,
+               position = position_dodge(width = 0.75),
+               show.legened = FALSE,
+               color = "black") +
+  facet_wrap(~TE_Desc, scales = "free") + 
+  theme_minimal_grid(font_size = 15) + 
+  theme(
+    strip.background = element_rect(color = "lightgrey"),
+    legend.position = c(0.90,0.3), 
+    legend.direction = "horizontal", 
+    legend.justification = "right",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) + 
+  scale_fill_manual(values = c("Low" = "#7876B1FF", "High" = "#E18727FF")) + 
+  labs(x = NULL, y = "# Transposable Elements", fill = NULL) + 
+  guides(fill=guide_legend(override.aes = list(size=6)))
+
+```
+
+
+
+I looked more closely at the LTR, SINE, LINE, and DNA TEs by type (not as aggregate class) to see if any specific types may be driving NLR variation. I did not see any pattern of this--i.e. not variation between chromosomes that seemed to correlate with high density NLR regions, and no TEs that were at markedly higher abundance in High CNV than Low CNV. The one exception to this might be LTR/Caulimovirus elements, which seemed to differentiate between Low CNV and High CNV on every chromosome. 
+
+There is some evidence that LTR/CaMV elements can cause gene duplications (e.g. https://www.science.org/doi/abs/10.1126/science.1153040).
+
+There appeared to be some interesting Low CNV vs High CNV variation in LINE/L2 elements, but there relatively few TEs of this type and at least one High CNV genotype that had 0 of them. Moreover, thy were distributed across all 10 chromosomes, and did not seem localized to the NLR dense regions. 
+
+```{r}
+# Create data frame to check if observed differeces in LTR/CaMV are significant
+te_type <- "LTR"
+
+# Again filter out low abundance TEs
+te_sum_remove <- 
+  te %>% 
+  filter(TE_Type == te_type) %>%
+  group_by(Genotype, TE_Desc, Chr) %>% 
+  tally(name = "num_te_type") %>%
+  group_by(TE_Desc) %>% 
+  summarise(te_total = sum(num_te_type)) %>% 
+  filter(te_total > 1000)
+
+# Create model dataframe
+mod <- 
+  te %>% 
+  filter(TE_Type == te_type) %>%
+  group_by(Genotype, TE_Desc, Chr) %>% 
+  filter(Chr != "Chr0") %>%
+  tally(name = "num_te_type") %>%
+  .[.$TE_Desc %in% te_sum_remove$TE_Desc,] %>% 
+  add_column(CNV = ifelse(.$Genotype == "CCN-51" | .$Genotype == "ICS-1" |
+                            .$Genotype == "GU-257E" | .$Genotype == "NA-246", "Low", "High")) %>% 
+  .[grepl("Caulimovirus", .$TE_Desc),]
+
+
+# Fit a GLM with a negative binomial distribution--poisson didn't seem to fit
+glm_mod <- glm.nb(num_te_type ~ CNV + Chr + Chr:CNV,  data = mod)
+
+# Does a negative binomial dist fit the data? If p > 0.05 a negative binomial dist is appropriate
+1 - pchisq(summary(glm_mod)$deviance, summary(glm_mod)$df.residual)
+
+# Use emmeans to do posthoc comparisons
+pairs(emmeans(glm_mod,  ~ CNV + Chr + Chr:CNV))
+
+# Pairwise comparisons using emmeans
+mod <- summary(pairs(emmeans(glm_mod,  ~ ~ CNV + Chr + Chr:CNV))) %>% 
+  filter(p.value< 0.05)
+
+
+
+```
+
+There appear to be differences between chr in LTR/CaMV content, but none of it is associated with variation between Low CNV and High CNV (i.e. no sig differences between, for example, Chr5 Low -- Chr5 High). 
+
+
+
